@@ -69,6 +69,14 @@ The library targets the Motoko compiler and the `core` package resolved by mops:
 moc --check $(mops sources) src/Admin.mo
 ```
 
+## Acknowledgements
+
+This library is written in [Motoko](https://github.com/dfinity/motoko) and builds
+on the **canister model** pioneered by the [Internet Computer](https://internetcomputer.org)
+and the [DFINITY Foundation](https://dfinity.org) — smart contracts as
+orthogonally-persistent actors. Their work is excellent and directly inspired this
+stack. We are grateful to the DFINITY team and the wider IC community.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
