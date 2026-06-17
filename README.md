@@ -16,6 +16,7 @@ backend toolkit.
 | `MemphisAuth` | Memphis passkey identity. Verifies a passkey session and resolves it to a stable principal the backend can trust. |
 | `Users` | User registration, profiles, avatars, and role tiers — built on top of `Admin`. |
 | `Pagination` | Bounded, offset-cursor paging over an ordered array, so every list read stays within a fixed instruction budget. |
+| `Invoices` | Invoicing — line items, on-chain-recomputed totals and tax, a `draft → issued → paid` / `void` lifecycle with per-party guards, and an immutable audit trail. Shared by the commerce and billing examples. |
 
 All four are **pure modules** (no actor, no internal state): the host actor owns the
 state and passes it in. This keeps upgrades simple and the modules trivially testable.
