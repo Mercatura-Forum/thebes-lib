@@ -1,0 +1,13 @@
+Thebes Protocol Motoko Library (thebes-lib)
+Copyright (c) 2026 Mercatura Forum
+
+The backend library shared by the Thebes Layer 1 example dapps. It builds on the
+Motoko core library:
+
+  • Motoko core library — © DFINITY Foundation, Apache-2.0
+                          https://github.com/dfinity/motoko-core
+
+Licensed under the Apache License, Version 2.0. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+Authored by the Thebes Protocol contributors.
