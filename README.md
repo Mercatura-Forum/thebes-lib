@@ -1,7 +1,7 @@
 # thebes-lib
 
 The Motoko backend library for [Thebes Protocol](https://github.com/Mercatura-Forum/Thebes-Protocol-)
-applications. It provides the four building blocks a production dapp backend needs —
+applications. It provides the five building blocks a production dapp backend needs —
 controller-gated administration, passkey identity, user management, and bounded
 pagination — as pure, composable modules that hold no state of their own.
 
@@ -18,7 +18,7 @@ backend toolkit.
 | `Pagination` | Bounded, offset-cursor paging over an ordered array, so every list read stays within a fixed instruction budget. |
 | `Invoices` | Invoicing — line items, on-chain-recomputed totals and tax, a `draft → issued → paid` / `void` lifecycle with per-party guards, and an immutable audit trail. Shared by the commerce and billing examples. |
 
-All four are **pure modules** (no actor, no internal state): the host actor owns the
+All five are **pure modules** (no actor, no internal state): the host actor owns the
 state and passes it in. This keeps upgrades simple and the modules trivially testable.
 
 ## Add it
@@ -30,7 +30,7 @@ account required. Pin a tag for reproducible builds:
 # mops.toml
 [dependencies]
 core = "2.5.0"
-thebes-lib = "https://github.com/Mercatura-Forum/thebes-lib#v0.1.0"
+thebes-lib = "https://github.com/Mercatura-Forum/thebes-lib#v0.2.0"
 ```
 
 ```sh
