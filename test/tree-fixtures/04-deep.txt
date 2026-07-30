@@ -1,0 +1,24 @@
+set /a/x/deep/leaf-1 ecfb7275cd796a6eb8e45d2011b991e220254543cde1f0259b1a91c2af3d5003
+set /a/xx/deep/deep/leaf-2 0b264d1a44a92f208087e93643a9d940bf5f32b4bc4aa641f5b156860949f81e
+set /a/xxx/deep/deep/deep/leaf-3 0bc63565e557c548394894bbddb1404ac05317f08b607cc183cda9492b89f7fa
+root
+witness /a/x/deep/leaf-1
+witness /a/xxx/deep/deep/deep/leaf-3
+set /a/xxxx/deep/deep/deep/deep/leaf-4 76333ca97ddc37a2280006db9e2359195ca6242cb7070fe62da0ef766f5b5682
+set /a/xxxxx/deep/deep/deep/deep/deep/leaf-5 cbe0de0e3151b3a4583284cbad96e448015ec46ce23a67f8776f9192daab69ce
+root
+witness /a/x/deep/leaf-1
+witness /a/xx/deep/deep/leaf-2
+witness /a/xxx/deep/deep/deep/leaf-3
+witness /a/xxxx/deep/deep/deep/deep/leaf-4
+witness /a/xxxxx/deep/deep/deep/deep/deep/leaf-5
+set /a/xxxxxx/deep/deep/deep/deep/deep/deep/leaf-6 3d6b484e36866bde135dbb59e9b1e11424c5357f05e8917984e7f912232eb142
+set /a/xxxxxxx/deep/deep/deep/deep/deep/deep/deep/leaf-7 93502a51820d4be9bc823639a29cd3b68bf746220dc969903fc3fe668f5b3e13
+root
+witness /a/x/deep/leaf-1
+witness /a/xxxxxxx/deep/deep/deep/deep/deep/deep/deep/leaf-7
+set /a/xxxxxxxx/deep/deep/deep/deep/deep/deep/deep/deep/leaf-8 dcfe6df2b63b9665e728d35c0d0db22795f018a9dac3c2863a2b647489f09522
+set /a/xxxxxxxxx/deep/deep/deep/deep/deep/deep/deep/deep/deep/leaf-9 98cc014e6133d1408363cb7ddae43fb2534358c0820c26757b426cad6c58785d
+root
+witness /a/x/deep/leaf-1
+witness /a/xxxxxxxxx/deep/deep/deep/deep/deep/deep/deep/deep/deep/leaf-9

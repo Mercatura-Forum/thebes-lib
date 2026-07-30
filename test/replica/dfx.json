@@ -1,0 +1,21 @@
+{
+  "canisters": {
+    "media_app": {
+      "type": "custom",
+      "wasm": "media_app.wasm",
+      "candid": "media_app.did"
+    },
+    "media_app_heap": {
+      "type": "custom",
+      "wasm": "media_app_heap.wasm",
+      "candid": "media_app.did"
+    }
+  },
+  "networks": {
+    "local": {
+      "bind": "127.0.0.1:14943",
+      "type": "ephemeral"
+    }
+  },
+  "version": 1
+}

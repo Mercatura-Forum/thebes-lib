@@ -1,0 +1,4 @@
+set /avatar/aaaaa-aa 35ddac59a742bd624d7b51e4b397c9160bdfa393b32e8542236b53d718a4335e
+root
+witness /avatar/aaaaa-aa
+witness /missing

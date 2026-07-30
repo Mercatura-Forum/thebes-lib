@@ -1,3 +1,12 @@
 .mops/
 mops.lock
 .DS_Store
+
+# Rust build artifacts — the reference binary is always built from source.
+**/target/
+
+# Internal working notes never belong in this repository.
+for-team/
+
+# Regenerated into a temp dir by test/run-tree-reference.sh.
+test/tree-fixtures/*.expected
