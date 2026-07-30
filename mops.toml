@@ -1,10 +1,13 @@
 [package]
 name = "thebes-lib"
-version = "0.2.0"
-description = "Thebes Protocol Motoko backend library — Admin (controller-gated operations), MemphisAuth (passkey session verification), Users (roles, profiles, avatars), and Pagination (bounded list reads). The single backend library every Thebes example dapp depends on."
+version = "0.3.0"
+description = "Thebes Protocol Motoko backend library — Admin (controller-gated operations), MemphisAuth (passkey session verification), Users (roles, profiles, avatars), Pagination (bounded list reads), Invoices (recomputed totals and lifecycle), and Media (certified on-chain images with chunked upload, dedup and quotas). The single backend library every Thebes example dapp depends on."
 repository = "https://github.com/Mercatura-Forum/thebes-lib"
-keywords = ["thebes", "egypt-l1", "motoko", "auth", "admin"]
+keywords = ["thebes", "egypt-l1", "motoko", "auth", "admin", "media"]
 license = "Apache-2.0"
 
 [dependencies]
 core = "2.5.0"
+
+[toolchain]
+moc = "1.4.1"
