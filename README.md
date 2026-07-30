@@ -1,9 +1,10 @@
 # thebes-lib
 
 The Motoko backend library for [Thebes Protocol](https://github.com/Mercatura-Forum/Thebes-Protocol-)
-applications. It provides the five building blocks a production dapp backend needs —
-controller-gated administration, passkey identity, user management, and bounded
-pagination — as pure, composable modules that hold no state of their own.
+applications. It provides the six building blocks a production dapp backend needs —
+controller-gated administration, passkey identity, user management, bounded
+pagination, invoicing, and on-chain certified media — as pure, composable modules
+that hold no state of their own.
 
 Every Thebes example dapp depends on this library; it is the single source for the
 backend toolkit.
@@ -17,9 +18,17 @@ backend toolkit.
 | `Users` | User registration, profiles, avatars, and role tiers — built on top of `Admin`. |
 | `Pagination` | Bounded, offset-cursor paging over an ordered array, so every list read stays within a fixed instruction budget. |
 | `Invoices` | Invoicing — line items, on-chain-recomputed totals and tax, a `draft → issued → paid` / `void` lifecycle with per-party guards, and an immutable audit trail. Shared by the commerce and billing examples. |
+| `Media` | On-chain, certified user media (logos, avatars, photos) inside the app's own canister — chunked uploads (≤ 32 KiB), content-addressed dedup + refcount, per-principal quotas, image-header validation (JPEG/PNG/WebP/GIF magic + dimensions), blob bytes in `Region` stable memory with a free-list allocator, and a domain-separated Merkle tree for certified serving (byte-compatible with the Egypt-L1 media canister's witness encoding). |
 
-All five are **pure modules** (no actor, no internal state): the host actor owns the
+All six are **pure modules** (no actor, no internal state): the host actor owns the
 state and passes it in. This keeps upgrades simple and the modules trivially testable.
+
+`Media` bounds storage; it does not transform bytes: clients downscale/re-encode
+(thebes-sdk `downscaleImage`) and the module enforces class byte caps
+(avatar/logo ≤ 64 KiB, photo ≤ 512 KiB), magic-byte ↔ content-type agreement,
+and real header-parsed dimension ceilings (256 px avatar/logo, 1600 px photo) at
+finalize. The app republishes the media tree root via `CertifiedData.set(Media.root(store))`
+after mutations — see the module header for the integration sketch.
 
 ## Add it
 
@@ -30,7 +39,7 @@ account required. Pin a tag for reproducible builds:
 # mops.toml
 [dependencies]
 core = "2.5.0"
-thebes-lib = "https://github.com/Mercatura-Forum/thebes-lib#v0.2.0"
+thebes-lib = "https://github.com/Mercatura-Forum/thebes-lib#v0.3.0"
 ```
 
 ```sh
