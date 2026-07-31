@@ -33,7 +33,7 @@ in `test/tree-reference`) by `test/run-tree-reference.sh` — run it (and
 ## How it is consumed
 
 Two ways: as a **pinned mops GitHub dependency**
-(`thebes-lib = "https://github.com/Mercatura-Forum/thebes-lib#v0.3.0"`) or — in
+(`thebes-lib = "https://github.com/Mercatura-Forum/thebes-lib#v0.4.0"`) or — in
 every `thebes-example-*` repository — as a **vendored snapshot** under
 `motoko/thebes-lib` (a local mops path dep). This repo is the upstream source of
 truth; never patch a vendored copy in an example.

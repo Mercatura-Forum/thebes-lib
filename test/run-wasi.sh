@@ -38,7 +38,7 @@ if [[ "${1:-}" == "--teeth" ]]; then
     [reclaim-off]='s|func regionFree(s : Store, offset : Nat64, len : Nat64) {\n    if (len == 0) { return };|func regionFree(s : Store, offset : Nat64, len : Nat64) {\n    if (true) { return };|'
     [free-off]='s|        if (meta.refcount == 0) {|        if (false) {|'
   )
-  for name in dedup-off reclaim-off free-off; do
+  for name in dedup-off reclaim-off free-off anon-off pause-chunk-off unlist-eager listing-open variant-swap; do
     patched="$OUT/patched-$name"
     mkdir -p "$patched"
     cp src/*.mo "$patched/"
@@ -58,6 +58,41 @@ elif name == "free-off":
     needle = "        if (meta.refcount == 0) {"
     assert needle in src, "free anchor missing"
     src = src.replace(needle, "        if (false) {")
+elif name == "anon-off":
+    # drop every anonymous-principal refusal
+    needle = "if (Principal.isAnonymous(caller)) { return #err(#Anonymous) };"
+    assert needle in src, "anon anchor missing"
+    src = src.replace(needle, "// anon gate disabled")
+elif name == "pause-chunk-off":
+    # keep pause on start/finish, drop it on the chunk arm only — the exact
+    # hole the ruling closed (staged storage grows while paused)
+    needle = """    // Pause must block chunk writes too: gating only start and finish would
+    // still let staged storage grow while the contract is paused, which is
+    // the one thing pause exists to stop.
+    if (Admin.isPaused(admin)) { return #err(#Paused) };"""
+    assert needle in src, "pause-chunk anchor missing"
+    src = src.replace(needle, "    // pause gate on chunk disabled")
+elif name == "unlist-eager":
+    # restore the pre-v0.4.0 defect: unlist regardless of refcount
+    needle = "      if (not Map.containsKey(s.blobs, Blob.compare, hash)) {"
+    assert needle in src, "unlist anchor missing"
+    src = src.replace(needle, "      if (true) {")
+elif name == "variant-swap":
+    # The typed-error control. Swap #NotOwner for #NotAdmin AND rewrite
+    # errorText so the swapped variant renders the ORIGINAL string. Rendered
+    # output is therefore byte-identical, so any assertion that only matches
+    # prose still passes: ONLY a named-variant assertion can catch this.
+    needle = "if (not Principal.equal(up.owner, caller)) { return #err(#NotOwner) };"
+    assert src.count(needle) == 2, f"expected 2 NotOwner sites, found {src.count(needle)}"
+    src = src.replace(needle, "if (not Principal.equal(up.owner, caller)) { return #err(#NotAdmin) };")
+    txt = '      case (#NotAdmin) "caller is not an admin";'
+    assert txt in src, "errorText #NotAdmin arm missing"
+    src = src.replace(txt, '      case (#NotAdmin) "not the owner of this upload";')
+elif name == "listing-open":
+    needle = """    if (not Admin.isAdmin(admin, caller)) { return #err(#NotAdmin) };
+    #ok(listPaths(s));"""
+    assert needle in src, "listing anchor missing"
+    src = src.replace(needle, "    #ok(listPaths(s));")
 open(path, "w").write(src)
 EOF
     if run_suite test/wasi/Policy.mo "$patched" > "$OUT/teeth-$name.log" 2>&1; then

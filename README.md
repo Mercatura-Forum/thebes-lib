@@ -18,7 +18,7 @@ backend toolkit.
 | `Users` | User registration, profiles, avatars, and role tiers — built on top of `Admin`. |
 | `Pagination` | Bounded, offset-cursor paging over an ordered array, so every list read stays within a fixed instruction budget. |
 | `Invoices` | Invoicing — line items, on-chain-recomputed totals and tax, a `draft → issued → paid` / `void` lifecycle with per-party guards, and an immutable audit trail. Shared by the commerce and billing examples. |
-| `Media` | On-chain, certified user media (logos, avatars, photos) inside the app's own canister — chunked uploads (≤ 32 KiB), content-addressed dedup + refcount, per-principal quotas, image-header validation (JPEG/PNG/WebP/GIF magic + dimensions), blob bytes in `Region` stable memory with a free-list allocator, and a domain-separated Merkle tree for certified serving (byte-compatible with the Egypt-L1 media canister's witness encoding). |
+| `Media` | On-chain, certified user media (logos, avatars, photos) inside the app's own canister — typed refusals (`#Paused`, `#Anonymous`, `#QuotaExceeded` carrying limit and usage), admin-scoped listing — chunked uploads (≤ 32 KiB), content-addressed dedup + refcount, per-principal quotas, image-header validation (JPEG/PNG/WebP/GIF magic + dimensions), blob bytes in `Region` stable memory with a free-list allocator, and a domain-separated Merkle tree for certified serving (byte-compatible with the Egypt-L1 media canister's witness encoding). |
 
 All six are **pure modules** (no actor, no internal state): the host actor owns the
 state and passes it in. This keeps upgrades simple and the modules trivially testable.
@@ -39,7 +39,7 @@ account required. Pin a tag for reproducible builds:
 # mops.toml
 [dependencies]
 core = "2.5.0"
-thebes-lib = "https://github.com/Mercatura-Forum/thebes-lib#v0.3.0"
+thebes-lib = "https://github.com/Mercatura-Forum/thebes-lib#v0.4.0"
 ```
 
 ```sh

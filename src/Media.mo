@@ -14,6 +14,11 @@
 ///   • Content-addressed dedup: blobs are keyed by sha256(body) with a
 ///     refcount — identical bytes are stored once; replacing or deleting
 ///     media frees the bytes.
+///   • Refused for the right reasons, with typed errors: `#Paused` while the
+///     app is paused (uploads AND chunk writes — a pause that let staged
+///     bytes accumulate would not be a pause), `#Anonymous` for the anonymous
+///     principal, `#QuotaExceeded` carrying limit AND usage so a panel can
+///     render "23 of 256". `errorText` renders any of them.
 ///   • Caller-gated writes: a principal writes only its own namespace
 ///     (`/avatar/{principal}`, its own photo set); logos require the caller
 ///     to pass the app's `Admin.State` admin check. Serve paths are derived
@@ -168,6 +173,56 @@ module {
   /// Media class. `#logo name` carries the app-wide slot name (validated:
   /// 1..=64 chars of [a-z0-9._-]); logos are admin-gated via `Admin.State`.
   public type Class = { #avatar; #photo; #logo : Text };
+
+  /// Why a call was refused. Typed so a caller can render the reason —
+  /// `#QuotaExceeded` carries the limit AND the usage at the moment of
+  /// refusal, so a panel can show "23 of 256" without parsing prose.
+  ///
+  /// The `*OrTrap` twins turn any of these into a trap via `errorText`. That
+  /// is deliberate and must stay: this engine swallows `msg_reject`, so a
+  /// guarded actor method has to trap in order to both reject the call and
+  /// roll back its state changes.
+  public type MediaError = {
+    #Paused;
+    #Anonymous;
+    #NotOwner;
+    #NotAdmin;
+    #QuotaExceeded : { scope : Text; limit : Nat; usage : Nat };
+    #StorageFull : { capBytes : Nat; usedBytes : Nat; requestedBytes : Nat };
+    #ChunkTooLarge : { limit : Nat; got : Nat };
+    #IncompleteUpload : { missing : Nat; firstMissing : [Nat] };
+    #NotFound : { what : Text };
+    #Validation : { reason : Text };
+  };
+
+  /// Human-readable form of a `MediaError` (what the `*OrTrap` twins trap with).
+  public func errorText(e : MediaError) : Text {
+    switch (e) {
+      case (#Paused) "contract is paused";
+      case (#Anonymous) "the anonymous principal may not write media";
+      case (#NotOwner) "not the owner of this upload";
+      case (#NotAdmin) "caller is not an admin";
+      case (#QuotaExceeded(q)) {
+        q.scope # " quota exceeded: " # Nat.toText(q.usage) # " of " # Nat.toText(q.limit) # " used";
+      };
+      case (#StorageFull(s)) {
+        "media storage full: stored " # Nat.toText(s.usedBytes) # " + "
+        # Nat.toText(s.requestedBytes) # " would exceed cap " # Nat.toText(s.capBytes) # " bytes";
+      };
+      case (#ChunkTooLarge(c)) {
+        "chunk body " # Nat.toText(c.got) # " bytes exceeds MAX_CHUNK_BYTES=" # Nat.toText(c.limit);
+      };
+      case (#IncompleteUpload(u)) {
+        var idx = "";
+        for (i in u.firstMissing.vals()) {
+          idx #= (if (idx == "") "" else ", ") # Nat.toText(i);
+        };
+        "cannot finish: " # Nat.toText(u.missing) # " chunks still missing — indices [" # idx # "]";
+      };
+      case (#NotFound(n)) n.what # " not found";
+      case (#Validation(v)) v.reason;
+    };
+  };
 
   /// Region-backed blob record: bytes live at [offset, offset+size) in the
   /// store's region; `refcount` counts pointers (avatar slots + photo-set
@@ -705,7 +760,7 @@ module {
   /// Acquire a reference: dedup bump if the hash is stored; otherwise
   /// enforce the byte budget, write the bytes to the region and index them.
   /// Mutates NOTHING on #err (lib.rs:440-467).
-  func acquire(s : Store, hash : Blob, contentType : Text, body : Blob) : Result.Result<(), Text> {
+  func acquire(s : Store, hash : Blob, contentType : Text, body : Blob) : Result.Result<(), MediaError> {
     switch (Map.get(s.blobs, Blob.compare, hash)) {
       case (?meta) {
         // Dedup: no new bytes (saturating like the Rust u32).
@@ -716,10 +771,11 @@ module {
     };
     let len = Nat64.fromNat(body.size());
     if (s.totalBytes + len > MAX_MEDIA_BYTES) {
-      return #err(
-        "media storage full: stored " # Nat64.toText(s.totalBytes) # " + " # Nat64.toText(len)
-        # " would exceed cap " # Nat64.toText(MAX_MEDIA_BYTES) # " bytes"
-      );
+      return #err(#StorageFull({
+        capBytes = Nat64.toNat(MAX_MEDIA_BYTES);
+        usedBytes = Nat64.toNat(s.totalBytes);
+        requestedBytes = Nat64.toNat(len);
+      }));
     };
     let offset = regionAlloc(s, len);
     if (len > 0) { Region.storeBlob(s.region, offset, body) };
@@ -824,15 +880,13 @@ module {
   /// Logo writes are admin-gated (the Admin.mo pattern); checked at start
   /// AND at finish — the finish check is the security boundary (admin status
   /// can change mid-upload).
-  func requireLogoAuthorized(admin : Admin.State, caller : Principal, c : Class) : Result.Result<(), Text> {
+  func requireLogoAuthorized(admin : Admin.State, caller : Principal, c : Class) : Result.Result<(), MediaError> {
     switch (c) {
       case (#logo name) {
         if (not validLogoName(name)) {
-          return #err("logo name must be 1..=64 chars of [a-z0-9._-]");
+          return #err(#Validation({ reason = "logo name must be 1..=64 chars of [a-z0-9._-]" }));
         };
-        if (not Admin.isAdmin(admin, caller)) {
-          return #err("Media: caller is not an admin (logo class)");
-        };
+        if (not Admin.isAdmin(admin, caller)) { return #err(#NotAdmin) };
         #ok;
       };
       case _ #ok;
@@ -976,23 +1030,23 @@ module {
 
   /// The finalize-time image gate: magic must parse, must AGREE with the
   /// declared content type (spoof reject) and fit the class dimension cap.
-  func validateImage(b : [Nat8], declaredCt : Text, maxDim : Nat) : Result.Result<(), Text> {
+  func validateImage(b : [Nat8], declaredCt : Text, maxDim : Nat) : Result.Result<(), MediaError> {
     switch (sniffImage(b)) {
-      case (#err(e)) { #err("image validation failed: " # e) };
+      case (#err(e)) { #err(#Validation({ reason = "image validation failed: " # e })) };
       case (#ok(d)) {
         if (d.mime != declaredCt) {
-          return #err(
-            "content_type mismatch: declared \"" # declaredCt # "\" but magic bytes are " # d.mime
-          );
+          return #err(#Validation({
+            reason = "content_type mismatch: declared \"" # declaredCt # "\" but magic bytes are " # d.mime;
+          }));
         };
         if (d.width == 0 or d.height == 0) {
-          return #err("image has zero dimension");
+          return #err(#Validation({ reason = "image has zero dimension" }));
         };
         if (d.width > maxDim or d.height > maxDim) {
-          return #err(
-            "image " # Nat.toText(d.width) # "x" # Nat.toText(d.height)
-            # " exceeds max dimension " # Nat.toText(maxDim) # " for this class"
-          );
+          return #err(#Validation({
+            reason = "image " # Nat.toText(d.width) # "x" # Nat.toText(d.height)
+              # " exceeds max dimension " # Nat.toText(maxDim) # " for this class";
+          }));
         };
         #ok;
       };
@@ -1012,44 +1066,56 @@ module {
     mediaClass : Class,
     contentType : Text,
     totalChunks : Nat,
-  ) : Result.Result<(), Text> {
+  ) : Result.Result<(), MediaError> {
+    // Pause stops storage from growing at all — so it gates every arm of the
+    // upload path (start, chunk, finish), not just the ends.
+    if (Admin.isPaused(admin)) { return #err(#Paused) };
+    // The anonymous principal owns no namespace and cannot be held to a
+    // quota, so it may not write media.
+    if (Principal.isAnonymous(caller)) { return #err(#Anonymous) };
     switch (requireLogoAuthorized(admin, caller, mediaClass)) {
       case (#err(e)) { return #err(e) };
       case (#ok) {};
     };
     if (not classAllowsContentType(contentType)) {
-      return #err(
-        "content_type \"" # contentType # "\" not allowed for media_class " # classText(mediaClass)
-      );
+      return #err(#Validation({
+        reason = "content_type \"" # contentType # "\" not allowed for media_class " # classText(mediaClass);
+      }));
     };
     // Byte length, matching Rust's String::len (lib.rs:522).
     let idBytes = Text.encodeUtf8(uploadId).size();
     if (idBytes == 0 or idBytes > 128) {
-      return #err("upload_id must be 1..=128 chars");
+      return #err(#Validation({ reason = "upload_id must be 1..=128 chars" }));
     };
-    if (totalChunks == 0) { return #err("total_chunks must be > 0") };
+    if (totalChunks == 0) {
+      return #err(#Validation({ reason = "total_chunks must be > 0" }));
+    };
     if (totalChunks > classMaxChunks(mediaClass)) {
-      return #err(
-        "total_chunks exceeds ceiling of " # Nat.toText(classMaxChunks(mediaClass))
-        # " for " # classText(mediaClass)
-      );
+      return #err(#Validation({
+        reason = "total_chunks exceeds ceiling of " # Nat.toText(classMaxChunks(mediaClass))
+          # " for " # classText(mediaClass);
+      }));
     };
     ignore bumpTick(s);
     gcStale(s);
     if (Map.size(s.staging) >= MAX_CONCURRENT_STAGED_UPLOADS) {
-      return #err(
-        "too many concurrent staged uploads (cap = " # Nat.toText(MAX_CONCURRENT_STAGED_UPLOADS) # ")"
-      );
+      return #err(#QuotaExceeded({
+        scope = "concurrent staged uploads";
+        limit = MAX_CONCURRENT_STAGED_UPLOADS;
+        usage = Map.size(s.staging);
+      }));
     };
     if (stagedCountFor(s, caller) >= MAX_STAGED_PER_PRINCIPAL) {
-      return #err(
-        "principal already has " # Nat.toText(MAX_STAGED_PER_PRINCIPAL) # " staged uploads (cap)"
-      );
+      return #err(#QuotaExceeded({
+        scope = "staged uploads for this principal";
+        limit = MAX_STAGED_PER_PRINCIPAL;
+        usage = stagedCountFor(s, caller);
+      }));
     };
     if (Map.containsKey(s.staging, Text.compare, uploadId)) {
-      return #err(
-        "upload_id \"" # uploadId # "\" already in progress — use chunk_progress to resume"
-      );
+      return #err(#Validation({
+        reason = "upload_id \"" # uploadId # "\" already in progress — use chunk_progress to resume";
+      }));
     };
     Map.add(
       s.staging,
@@ -1072,32 +1138,33 @@ module {
   /// (lib.rs:573-611): size gate FIRST, then tick/gc/lookup/owner/range.
   public func storeChunk(
     s : Store,
+    admin : Admin.State,
     caller : Principal,
     uploadId : Text,
     chunkIndex : Nat,
     body : Blob,
-  ) : Result.Result<(), Text> {
+  ) : Result.Result<(), MediaError> {
+    // Pause must block chunk writes too: gating only start and finish would
+    // still let staged storage grow while the contract is paused, which is
+    // the one thing pause exists to stop.
+    if (Admin.isPaused(admin)) { return #err(#Paused) };
+    if (Principal.isAnonymous(caller)) { return #err(#Anonymous) };
     if (body.size() > MAX_CHUNK_BYTES) {
-      return #err(
-        "chunk " # Nat.toText(chunkIndex) # " body " # Nat.toText(body.size())
-        # " bytes exceeds MAX_CHUNK_BYTES=" # Nat.toText(MAX_CHUNK_BYTES)
-      );
+      return #err(#ChunkTooLarge({ limit = MAX_CHUNK_BYTES; got = body.size() }));
     };
     let tick = bumpTick(s);
     gcStale(s);
     switch (Map.get(s.staging, Text.compare, uploadId)) {
       case null {
-        #err("upload_id \"" # uploadId # "\" not found (GC'd or never started)");
+        #err(#NotFound({ what = "upload_id \"" # uploadId # "\" (GC'd or never started)" }));
       };
       case (?up) {
-        if (not Principal.equal(up.owner, caller)) {
-          return #err("not the owner of this upload");
-        };
+        if (not Principal.equal(up.owner, caller)) { return #err(#NotOwner) };
         if (chunkIndex >= up.totalChunks) {
-          return #err(
-            "chunk_index " # Nat.toText(chunkIndex) # " out of range (total_chunks = "
-            # Nat.toText(up.totalChunks) # ")"
-          );
+          return #err(#Validation({
+            reason = "chunk_index " # Nat.toText(chunkIndex) # " out of range (total_chunks = "
+              # Nat.toText(up.totalChunks) # ")";
+          }));
         };
         let firstTime = up.chunks[chunkIndex] == null;
         up.chunks[chunkIndex] := ?body;
@@ -1119,7 +1186,7 @@ module {
     hash : Blob,
     contentType : Text,
     body : Blob,
-  ) : Result.Result<Text, Text> {
+  ) : Result.Result<Text, MediaError> {
     let path = photoPath(hash);
     let ownedSet = Map.get(s.photosOf, Principal.compare, caller);
     let already = switch (ownedSet) {
@@ -1129,9 +1196,9 @@ module {
     if (not already) {
       let count = switch (ownedSet) { case (?set) Set.size(set); case null 0 };
       if (count >= MAX_PHOTOS_PER_PRINCIPAL) {
-        return #err(
-          "principal already owns " # Nat.toText(MAX_PHOTOS_PER_PRINCIPAL) # " items of this class (cap)"
-        );
+        return #err(#QuotaExceeded({
+          scope = "photos for this principal"; limit = MAX_PHOTOS_PER_PRINCIPAL; usage = count;
+        }));
       };
       switch (acquire(s, hash, contentType, body)) {
         case (#err(e)) { return #err(e) };
@@ -1165,13 +1232,15 @@ module {
     contentType : Text,
     body : Blob,
     slotCap : ?Nat,
-  ) : Result.Result<Text, Text> {
+  ) : Result.Result<Text, MediaError> {
     let old = Map.get(slots, compare, key);
     if (old != ?hash) {
       switch (slotCap) {
         case (?cap) {
           if (old == null and Map.size(slots) >= cap) {
-            return #err("app already has " # Nat.toText(cap) # " logo slots (cap)");
+            return #err(#QuotaExceeded({
+              scope = "logo slots"; limit = cap; usage = Map.size(slots);
+            }));
           };
         };
         case null {};
@@ -1196,16 +1265,16 @@ module {
     admin : Admin.State,
     caller : Principal,
     uploadId : Text,
-  ) : Result.Result<FinishReply, Text> {
+  ) : Result.Result<FinishReply, MediaError> {
+    if (Admin.isPaused(admin)) { return #err(#Paused) };
+    if (Principal.isAnonymous(caller)) { return #err(#Anonymous) };
     ignore bumpTick(s);
     gcStale(s);
     // Ownership check BEFORE removal (lib.rs:669-678).
     switch (Map.get(s.staging, Text.compare, uploadId)) {
-      case null { return #err("upload_id \"" # uploadId # "\" not found") };
+      case null { return #err(#NotFound({ what = "upload_id \"" # uploadId # "\"" })) };
       case (?up) {
-        if (not Principal.equal(up.owner, caller)) {
-          return #err("not the owner of this upload");
-        };
+        if (not Principal.equal(up.owner, caller)) { return #err(#NotOwner) };
       };
     };
     let up = switch (Map.take(s.staging, Text.compare, uploadId)) {
@@ -1229,15 +1298,10 @@ module {
       if (up.chunks[i] == null) { List.add(missing, i) };
     };
     if (List.size(missing) > 0) {
-      var preview = "";
       let previewCount = Nat.min(List.size(missing), 16);
-      for (i in Nat.range(0, previewCount)) {
-        preview := preview # (if (i > 0) ", " else "") # Nat.toText(List.at(missing, i));
-      };
-      let err = "cannot finish: " # Nat.toText(List.size(missing))
-        # " chunks still missing — indices [" # preview # "]";
+      let preview = Array.tabulate<Nat>(previewCount, func(i : Nat) : Nat { List.at(missing, i) });
       Map.add(s.staging, Text.compare, uploadId, up);
-      return #err(err);
+      return #err(#IncompleteUpload({ missing = List.size(missing); firstMissing = preview }));
     };
 
     // Assemble (lib.rs:700-713) + byte cap.
@@ -1246,10 +1310,10 @@ module {
       switch (c) { case (?blob) { totalLen += blob.size() }; case null {} };
     };
     if (totalLen > classMaxBytes(up.mediaClass)) {
-      return #err(
-        "assembled body " # Nat.toText(totalLen) # " bytes exceeds " # classText(up.mediaClass)
-        # " cap of " # Nat.toText(classMaxBytes(up.mediaClass))
-      );
+      return #err(#Validation({
+        reason = "assembled body " # Nat.toText(totalLen) # " bytes exceeds " # classText(up.mediaClass)
+          # " cap of " # Nat.toText(classMaxBytes(up.mediaClass));
+      }));
     };
     let bytes = VarArray.repeat<Nat8>(0, totalLen);
     var pos = 0;
@@ -1328,10 +1392,11 @@ module {
   /// Ported quirk kept intentionally: the shared content-addressed path is
   /// unlisted even if another principal still owns the same hash (the bytes
   /// survive via refcount; a re-upload relists) — see the report.
-  public func deletePhoto(s : Store, caller : Principal, sha256Hex : Text) : Result.Result<Bool, Text> {
+  public func deletePhoto(s : Store, caller : Principal, sha256Hex : Text) : Result.Result<Bool, MediaError> {
+    if (Principal.isAnonymous(caller)) { return #err(#Anonymous) };
     let hash = switch (hexDecode32(sha256Hex)) {
       case (?h) h;
-      case null { return #err("sha256_hex must be 64 hex chars") };
+      case null { return #err(#Validation({ reason = "sha256_hex must be 64 hex chars" })) };
     };
     ignore bumpTick(s);
     let owned = switch (Map.get(s.photosOf, Principal.compare, caller)) {
@@ -1339,17 +1404,22 @@ module {
       case null false;
     };
     if (owned) {
-      Map.remove(s.pathIndex, Text.compare, photoPath(hash));
       release(s, hash);
+      // Photo paths are content-addressed, so two principals uploading
+      // identical bytes SHARE one `/photo/{hash}`. Unlist it only when the
+      // last reference drops — otherwise one owner's delete would stop
+      // serving another owner's live media. `release` removes the blob
+      // entry exactly when the refcount reaches zero.
+      if (not Map.containsKey(s.blobs, Blob.compare, hash)) {
+        Map.remove(s.pathIndex, Text.compare, photoPath(hash));
+      };
     };
     #ok(owned);
   };
 
   /// Delete a named logo slot (admin-gated; new-class analog of clearAvatar).
-  public func deleteLogo(s : Store, admin : Admin.State, caller : Principal, name : Text) : Result.Result<Bool, Text> {
-    if (not Admin.isAdmin(admin, caller)) {
-      return #err("Media: caller is not an admin (logo class)");
-    };
+  public func deleteLogo(s : Store, admin : Admin.State, caller : Principal, name : Text) : Result.Result<Bool, MediaError> {
+    if (not Admin.isAdmin(admin, caller)) { return #err(#NotAdmin) };
     ignore bumpTick(s);
     switch (Map.take(s.logos, Text.compare, name)) {
       case (?old) {
@@ -1429,7 +1499,28 @@ module {
     };
   };
 
-  /// All served paths in byte order (lib.rs:1062-1070).
+  /// Admin-scoped listing. Refuses a non-admin caller, so a panel can expose
+  /// "everything this app stores" without handing an enumeration to anyone
+  /// who asks.
+  ///
+  /// BE CLEAR ABOUT WHAT THIS BUYS. `pathIndex` IS the public serve set:
+  /// every path in it is deliberately fetchable by anyone through
+  /// `httpRequest` — that is what certified serving means. Gating the listing
+  /// buys ENUMERATION RESISTANCE (photo paths are `/photo/{sha256}`, so they
+  /// are unguessable), NOT confidentiality. A path that leaks once is public
+  /// forever. Media that must stay private needs a different design —
+  /// access-checked or encrypted serve — which this module does not do.
+  public func listPathsFor(
+    s : Store,
+    admin : Admin.State,
+    caller : Principal,
+  ) : Result.Result<[Text], MediaError> {
+    if (not Admin.isAdmin(admin, caller)) { return #err(#NotAdmin) };
+    #ok(listPaths(s));
+  };
+
+  /// All served paths in byte order (lib.rs:1062-1070). Unscoped: for the
+  /// host actor's own use. Expose `listPathsFor` to callers.
   public func listPaths(s : Store) : [Text] {
     let out = List.empty<Text>();
     for (path in Map.keys(s.pathIndex)) { List.add(out, path) };
@@ -1557,35 +1648,42 @@ module {
     totalChunks : Nat,
   ) {
     switch (startUpload(s, admin, caller, uploadId, mediaClass, contentType, totalChunks)) {
-      case (#err(e)) { Runtime.trap("Media: " # e) };
+      case (#err(e)) { Runtime.trap("Media: " # errorText(e)) };
       case (#ok) {};
     };
   };
 
-  public func storeChunkOrTrap(s : Store, caller : Principal, uploadId : Text, chunkIndex : Nat, body : Blob) {
-    switch (storeChunk(s, caller, uploadId, chunkIndex, body)) {
-      case (#err(e)) { Runtime.trap("Media: " # e) };
+  public func storeChunkOrTrap(
+    s : Store,
+    admin : Admin.State,
+    caller : Principal,
+    uploadId : Text,
+    chunkIndex : Nat,
+    body : Blob,
+  ) {
+    switch (storeChunk(s, admin, caller, uploadId, chunkIndex, body)) {
+      case (#err(e)) { Runtime.trap("Media: " # errorText(e)) };
       case (#ok) {};
     };
   };
 
   public func finishUploadOrTrap(s : Store, admin : Admin.State, caller : Principal, uploadId : Text) : FinishReply {
     switch (finishUpload(s, admin, caller, uploadId)) {
-      case (#err(e)) { Runtime.trap("Media: " # e) };
+      case (#err(e)) { Runtime.trap("Media: " # errorText(e)) };
       case (#ok(rep)) rep;
     };
   };
 
   public func deletePhotoOrTrap(s : Store, caller : Principal, sha256Hex : Text) : Bool {
     switch (deletePhoto(s, caller, sha256Hex)) {
-      case (#err(e)) { Runtime.trap("Media: " # e) };
+      case (#err(e)) { Runtime.trap("Media: " # errorText(e)) };
       case (#ok(b)) b;
     };
   };
 
   public func deleteLogoOrTrap(s : Store, admin : Admin.State, caller : Principal, name : Text) : Bool {
     switch (deleteLogo(s, admin, caller, name)) {
-      case (#err(e)) { Runtime.trap("Media: " # e) };
+      case (#err(e)) { Runtime.trap("Media: " # errorText(e)) };
       case (#ok(b)) b;
     };
   };

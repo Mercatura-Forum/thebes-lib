@@ -42,7 +42,7 @@ persistent actor MediaApp {
   };
 
   public shared ({ caller }) func putChunk(id : Text, index : Nat, bytes : Blob) : async () {
-    Media.storeChunkOrTrap(media, caller, id, index, bytes);
+    Media.storeChunkOrTrap(media, admin, caller, id, index, bytes);
   };
 
   public shared ({ caller }) func finishUpload(id : Text) : async Media.FinishReply {

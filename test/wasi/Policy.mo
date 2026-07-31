@@ -80,7 +80,7 @@ func upload(
   class_ : Media.Class,
   ct : Text,
   body : Blob,
-) : Result.Result<Media.FinishReply, Text> {
+) : Result.Result<Media.FinishReply, Media.MediaError> {
   let cs = chunksOf(body);
   switch (Media.startUpload(s, a, caller, id, class_, ct, cs.size())) {
     case (#err(e)) { return #err(e) };
@@ -88,7 +88,7 @@ func upload(
   };
   var i = 0;
   for (c in cs.vals()) {
-    switch (Media.storeChunk(s, caller, id, i, c)) {
+    switch (Media.storeChunk(s, a, caller, id, i, c)) {
       case (#err(e)) { return #err(e) };
       case (#ok) {};
     };
@@ -97,22 +97,41 @@ func upload(
   Media.finishUpload(s, a, caller, id);
 };
 
-func ok(r : Result.Result<Media.FinishReply, Text>) : Media.FinishReply {
+func ok(r : Result.Result<Media.FinishReply, Media.MediaError>) : Media.FinishReply {
   switch (r) {
     case (#ok(rep)) rep;
-    case (#err(e)) { Debug.print("UNEXPECTED ERR: " # e); assert false; loop {} };
+    case (#err(e)) { Debug.print("UNEXPECTED ERR: " # Media.errorText(e)); assert false; loop {} };
   };
 };
 
-func errContains(r : Result.Result<Media.FinishReply, Text>, needle : Text) {
+/// Assert the error is #Validation AND its reason carries `needle`. The
+/// VARIANT is half the contract: a suite that only matched prose would stay
+/// green if a variant were swapped while its rendered text was preserved.
+func errValidation(r : Result.Result<Media.FinishReply, Media.MediaError>, needle : Text) {
   switch (r) {
     case (#ok(rep)) { Debug.print("UNEXPECTED OK: " # rep.path); assert false };
-    case (#err(e)) {
-      if (not Text.contains(e, #text needle)) {
-        Debug.print("ERR \"" # e # "\" missing \"" # needle # "\"");
+    case (#err(#Validation(v))) {
+      if (not Text.contains(v.reason, #text needle)) {
+        Debug.print("reason \"" # v.reason # "\" missing \"" # needle # "\"");
         assert false;
       };
     };
+    case (#err(e)) {
+      Debug.print("expected #Validation, got: " # Media.errorText(e)); assert false;
+    };
+  };
+};
+
+func errIsNotAdmin(r : Result.Result<Media.FinishReply, Media.MediaError>) {
+  switch (r) { case (#err(#NotAdmin)) {}; case (_) { Debug.print("expected #NotAdmin"); assert false } };
+};
+func errIsNotOwner(r : Result.Result<Media.FinishReply, Media.MediaError>) {
+  switch (r) { case (#err(#NotOwner)) {}; case (_) { Debug.print("expected #NotOwner"); assert false } };
+};
+func errIsQuota(r : Result.Result<Media.FinishReply, Media.MediaError>, scope : Text, limit : Nat) {
+  switch (r) {
+    case (#err(#QuotaExceeded(q))) { assert (q.scope == scope); assert (q.limit == limit) };
+    case (_) { Debug.print("expected #QuotaExceeded(" # scope # ")"); assert false };
   };
 };
 
@@ -214,12 +233,12 @@ do {
   let alice = p(0x30);
   let bob = p(0x31);
   assert (Result.isOk(Media.startUpload(s, a, alice, "u", #avatar, "image/webp", 1)));
-  switch (Media.storeChunk(s, bob, "u", 0, Fix.webp_lossy_64)) {
-    case (#err(e)) { assert (Text.contains(e, #text "owner")) };
+  switch (Media.storeChunk(s, a, bob, "u", 0, Fix.webp_lossy_64)) {
+    case (#err(#NotOwner)) {}; case (_) { assert false };
     case (#ok) { assert false };
   };
-  assert (Result.isOk(Media.storeChunk(s, alice, "u", 0, Fix.webp_lossy_64)));
-  errContains(Media.finishUpload(s, a, bob, "u"), "owner");
+  assert (Result.isOk(Media.storeChunk(s, a, alice, "u", 0, Fix.webp_lossy_64)));
+  errIsNotOwner(Media.finishUpload(s, a, bob, "u"));
   // Bob cannot reset alice's staging; alice can.
   assert (not Media.resetStaging(s, bob, "u"));
   assert (Media.chunkProgress(s, "u") != null);
@@ -252,7 +271,8 @@ do {
   assert (Media.mediaInfo(s, rep.path) != null);
   // Bad hash text is an error, not a false.
   switch (Media.deletePhoto(s, alice, "zz")) {
-    case (#err(e)) { assert (Text.contains(e, #text "64 hex")) };
+    case (#err(#Validation(v))) { assert (Text.contains(v.reason, #text "64 hex")) };
+    case (_) { assert false };
     case (#ok(_)) { assert false };
   };
   // Owner delete frees bytes + path + budget (lib.rs:1497-1509).
@@ -269,35 +289,36 @@ do {
   };
 };
 
-// ═══ 6. the ported shared-path delete quirk (lib.rs:815-828, kept exact) ═══
+// ═══ 6. shared content-addressed path: refcount-zero unlisting (v0.4.0) ═══
+// This scenario previously pinned the Rust reference's behaviour, in which the
+// FIRST delete unlisted the shared path for every owner while the bytes lived
+// on. That was ruled a defect rather than a quirk to port: one owner's delete
+// must not stop serving another owner's live media. The path is now unlisted
+// only when the last reference drops. Scenario 28 asserts the same property
+// from the serving side.
 do {
-  let (s, a) = begin("shared-path photo delete quirk ported exactly");
+  let (s, a) = begin("shared photo path: unlisted only at refcount zero");
   let alice = p(0x50);
   let bob = p(0x51);
   let body = Fix.gif_ok_64;
   let ra = ok(upload(s, a, alice, "x", #photo, "image/gif", body));
   ignore ok(upload(s, a, bob, "y", #photo, "image/gif", body));
-  // One blob, refcount 2, one shared content-addressed path.
   assert (Media.storageStats(s).blobCount == 1);
   assert (Media.storageStats(s).pathCount == 1);
-  // Alice deletes: the SHARED path is unlisted (the quirk) but the bytes
-  // survive via bob's refcount.
+  // Alice deletes: her ownership goes, bob's media keeps serving.
   switch (Media.deletePhoto(s, alice, ra.sha256Hex)) {
     case (#ok(d)) { assert d };
     case (#err(_)) { assert false };
   };
-  assert (Media.mediaInfo(s, ra.path) == null); // unlisted for bob too — ported behavior
-  assert (Media.storageStats(s).blobCount == 1); // bytes NOT freed
-  assert (Media.storageStats(s).totalBytes == body.size());
-  // Bob re-uploads → relists the path, still one blob.
-  ignore ok(upload(s, a, bob, "z", #photo, "image/gif", body));
   assert (Media.mediaInfo(s, ra.path) != null);
   assert (Media.storageStats(s).blobCount == 1);
-  // Bob deletes → last ref → fully gone.
+  assert (Media.storageStats(s).totalBytes == body.size());
+  // Bob deletes: last reference drops, path and bytes both go.
   switch (Media.deletePhoto(s, bob, ra.sha256Hex)) {
     case (#ok(d)) { assert d };
     case (#err(_)) { assert false };
   };
+  assert (Media.mediaInfo(s, ra.path) == null);
   assert (Media.storageStats(s).blobCount == 0);
   assert (Media.storageStats(s).totalBytes == 0);
 };
@@ -309,34 +330,40 @@ do {
   // avatar ceiling = 2 chunks (65536/32768); 3 rejected at START, before
   // any byte is staged (lib.rs:1476-1486).
   switch (Media.startUpload(s, a, alice, "x", #avatar, "image/jpeg", 3)) {
-    case (#err(e)) { assert (Text.contains(e, #text "exceeds ceiling")) };
+    case (#err(#Validation(v))) { assert (Text.contains(v.reason, #text "exceeds ceiling")) };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
   assert (Media.chunkProgress(s, "x") == null);
   // photo ceiling = 16; 17 rejected.
   switch (Media.startUpload(s, a, alice, "y", #photo, "image/jpeg", 17)) {
-    case (#err(e)) { assert (Text.contains(e, #text "exceeds ceiling")) };
+    case (#err(#Validation(v))) { assert (Text.contains(v.reason, #text "exceeds ceiling")) };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
   // chunk > 32 KiB rejected (checked FIRST, before existence — lib.rs:580).
-  switch (Media.storeChunk(s, alice, "nonexistent", 0, padded(Fix.jpeg_ok_64, 32769, 9))) {
-    case (#err(e)) { assert (Text.contains(e, #text "MAX_CHUNK_BYTES")) };
+  switch (Media.storeChunk(s, a, alice, "nonexistent", 0, padded(Fix.jpeg_ok_64, 32769, 9))) {
+    case (#err(#ChunkTooLarge(c))) { assert (c.limit == Media.MAX_CHUNK_BYTES); assert (c.got == 32769) };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
   // total_chunks = 0 rejected; bad content type rejected; id length gates.
-  errContains(upload(s, a, alice, "", #avatar, "image/jpeg", Fix.jpeg_ok_64), "1..=128");
+  errValidation(upload(s, a, alice, "", #avatar, "image/jpeg", Fix.jpeg_ok_64), "1..=128");
   switch (Media.startUpload(s, a, alice, "z", #avatar, "image/jpeg", 0)) {
-    case (#err(e)) { assert (Text.contains(e, #text "must be > 0")) };
+    case (#err(#Validation(v))) { assert (Text.contains(v.reason, #text "must be > 0")) };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
   switch (Media.startUpload(s, a, alice, "h", #avatar, "text/html", 1)) {
-    case (#err(e)) { assert (Text.contains(e, #text "not allowed")) };
+    case (#err(#Validation(v))) { assert (Text.contains(v.reason, #text "not allowed")) };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
   var longId = "";
   for (_ in Nat.range(0, 129)) { longId := longId # "a" };
   switch (Media.startUpload(s, a, alice, longId, #avatar, "image/jpeg", 1)) {
-    case (#err(e)) { assert (Text.contains(e, #text "1..=128")) };
+    case (#err(#Validation(v))) { assert (Text.contains(v.reason, #text "1..=128")) };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
   // Cap-exact avatar (65536 bytes = exactly 2 chunks) PASSES.
@@ -356,13 +383,18 @@ do {
     assert (Result.isOk(Media.startUpload(s, a, alice, "u" # Nat.toText(i), #avatar, "image/webp", 1)));
   };
   switch (Media.startUpload(s, a, alice, "overflow", #avatar, "image/webp", 1)) {
-    case (#err(e)) { assert (Text.contains(e, #text "staged uploads (cap)")) };
+    case (#err(#QuotaExceeded(q))) {
+      assert (q.scope == "staged uploads for this principal");
+      assert (q.limit == Media.MAX_STAGED_PER_PRINCIPAL);
+    };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
   // Duplicate upload id (from another principal too) is rejected.
   let bob = p(0x71);
   switch (Media.startUpload(s, a, bob, "u0", #avatar, "image/webp", 1)) {
-    case (#err(e)) { assert (Text.contains(e, #text "already in progress")) };
+    case (#err(#Validation(v))) { assert (Text.contains(v.reason, #text "already in progress")) };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
 };
@@ -387,8 +419,12 @@ do {
   for (up in Map.values(s.staging)) { up.lastActivityTicks := s.tick };
   let carol = p(0xF0);
   switch (Media.startUpload(s, a, carol, "past-global", #avatar, "image/webp", 1)) {
-    case (#err(e)) { assert (Text.contains(e, #text "too many concurrent")) };
-    case (#ok) { assert false };
+    case (#err(#QuotaExceeded(q))) {
+      assert (q.scope == "concurrent staged uploads");
+      assert (q.limit == Media.MAX_CONCURRENT_STAGED_UPLOADS);
+      assert (q.usage == Media.MAX_CONCURRENT_STAGED_UPLOADS);
+    };
+    case (_) { assert false };
   };
 };
 
@@ -400,12 +436,11 @@ do {
   let cs = chunksOf(body);
   assert (cs.size() == 3);
   assert (Result.isOk(Media.startUpload(s, a, alice, "u", #photo, "image/jpeg", 3)));
-  assert (Result.isOk(Media.storeChunk(s, alice, "u", 0, cs[0])));
-  assert (Result.isOk(Media.storeChunk(s, alice, "u", 2, cs[2])));
+  assert (Result.isOk(Media.storeChunk(s, a, alice, "u", 0, cs[0])));
+  assert (Result.isOk(Media.storeChunk(s, a, alice, "u", 2, cs[2])));
   switch (Media.finishUpload(s, a, alice, "u")) {
     case (#err(e)) {
-      assert (Text.contains(e, #text "1 chunks still missing"));
-      assert (Text.contains(e, #text "[1]"));
+      assert (e == #IncompleteUpload({ missing = 1; firstMissing = [1] }));
     };
     case (#ok(_)) { assert false };
   };
@@ -421,17 +456,18 @@ do {
     case null { assert false };
   };
   // chunk_index out of range.
-  switch (Media.storeChunk(s, alice, "u", 3, cs[0])) {
-    case (#err(e)) { assert (Text.contains(e, #text "out of range")) };
+  switch (Media.storeChunk(s, a, alice, "u", 3, cs[0])) {
+    case (#err(#Validation(v))) { assert (Text.contains(v.reason, #text "out of range")) };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
   // Re-storing an existing index replaces bytes without double-counting.
-  assert (Result.isOk(Media.storeChunk(s, alice, "u", 0, cs[0])));
+  assert (Result.isOk(Media.storeChunk(s, a, alice, "u", 0, cs[0])));
   switch (Media.chunkProgress(s, "u")) {
     case (?prog) { assert (prog.receivedCount == 2) };
     case null { assert false };
   };
-  assert (Result.isOk(Media.storeChunk(s, alice, "u", 1, cs[1])));
+  assert (Result.isOk(Media.storeChunk(s, a, alice, "u", 1, cs[1])));
   let rep = ok(Media.finishUpload(s, a, alice, "u"));
   assert (rep.size == 90000);
   // Last-write-wins on a re-stored chunk: 1-chunk avatar stored twice with
@@ -439,8 +475,8 @@ do {
   let b1 = Fix.jpeg_ok_64;
   let b2 = padded(Fix.jpeg_ok_64, 5000, 42);
   assert (Result.isOk(Media.startUpload(s, a, alice, "w", #avatar, "image/jpeg", 1)));
-  assert (Result.isOk(Media.storeChunk(s, alice, "w", 0, b1)));
-  assert (Result.isOk(Media.storeChunk(s, alice, "w", 0, b2)));
+  assert (Result.isOk(Media.storeChunk(s, a, alice, "w", 0, b1)));
+  assert (Result.isOk(Media.storeChunk(s, a, alice, "w", 0, b2)));
   let rep2 = ok(Media.finishUpload(s, a, alice, "w"));
   assert (rep2.size == 5000);
   assert (rep2.sha256Hex == Media.hexEncode(Media.sha256(Blob.toArray(b2))));
@@ -470,7 +506,10 @@ do {
   let alice = p(0xB0);
   s.totalBytes := Media.MAX_MEDIA_BYTES - 10;
   let r = upload(s, a, alice, "u", #avatar, "image/jpeg", Fix.jpeg_ok_64);
-  errContains(r, "storage full");
+  switch (r) {
+    case (#err(#StorageFull(f))) { assert (f.requestedBytes == Fix.jpeg_ok_64.size()) };
+    case (_) { assert false };
+  };
   assert (s.totalBytes == Media.MAX_MEDIA_BYTES - 10); // untouched
   assert (Media.storageStats(s).blobCount == 0);
   assert (Media.listPaths(s).size() == 0);
@@ -484,16 +523,18 @@ do {
   let user = p(0xC0);
   // Non-admin rejected at START.
   switch (Media.startUpload(s, a, user, "l", #logo("brand"), "image/png", 1)) {
-    case (#err(e)) { assert (Text.contains(e, #text "not an admin")) };
+    case (#err(#NotAdmin)) {}; case (_) { assert false };
     case (#ok) { assert false };
   };
   // Bad names rejected.
   switch (Media.startUpload(s, a, adminP, "l", #logo("Bad Name!"), "image/png", 1)) {
-    case (#err(e)) { assert (Text.contains(e, #text "logo name")) };
+    case (#err(#Validation(v))) { assert (Text.contains(v.reason, #text "logo name")) };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
   switch (Media.startUpload(s, a, adminP, "l", #logo(""), "image/png", 1)) {
-    case (#err(e)) { assert (Text.contains(e, #text "logo name")) };
+    case (#err(#Validation(v))) { assert (Text.contains(v.reason, #text "logo name")) };
+    case (_) { assert false };
     case (#ok) { assert false };
   };
   // Admin uploads a logo to a named slot.
@@ -508,9 +549,9 @@ do {
   let helper = p(0xC1);
   assert (Admin.addAdmin(a, adminP, helper));
   assert (Result.isOk(Media.startUpload(s, a, helper, "l2", #logo("brand.light"), "image/png", 1)));
-  assert (Result.isOk(Media.storeChunk(s, helper, "l2", 0, Fix.png_ok_64)));
+  assert (Result.isOk(Media.storeChunk(s, a, helper, "l2", 0, Fix.png_ok_64)));
   assert (Admin.removeAdmin(a, adminP, helper));
-  errContains(Media.finishUpload(s, a, helper, "l2"), "not an admin");
+  errIsNotAdmin(Media.finishUpload(s, a, helper, "l2"));
   assert (Media.chunkProgress(s, "l2") != null); // retryable
   assert (Admin.addAdmin(a, adminP, helper));
   ignore ok(Media.finishUpload(s, a, helper, "l2"));
@@ -519,7 +560,7 @@ do {
   assert (Media.storageStats(s).blobCount == 2); // dark(jpeg) + light(png)
   // Delete: non-admin refused; admin deletes; absent → false.
   switch (Media.deleteLogo(s, a, user, "brand.dark")) {
-    case (#err(e)) { assert (Text.contains(e, #text "not an admin")) };
+    case (#err(#NotAdmin)) {}; case (_) { assert false };
     case (#ok(_)) { assert false };
   };
   switch (Media.deleteLogo(s, a, adminP, "brand.dark")) {
@@ -537,9 +578,9 @@ do {
   for (i in Nat.range(0, Media.MAX_LOGOS)) {
     ignore ok(upload(s2, a2, adminP, "cap" # Nat.toText(i), #logo("slot" # Nat.toText(i)), "image/jpeg", padded(Fix.jpeg_ok_64, 4000 + i, 21)));
   };
-  errContains(
+  errIsQuota(
     upload(s2, a2, adminP, "cap65", #logo("slot-too-many"), "image/jpeg", Fix.jpeg_ok_64),
-    "logo slots (cap)",
+    "logo slots", Media.MAX_LOGOS,
   );
   ignore ok(upload(s2, a2, adminP, "capr", #logo("slot0"), "image/jpeg", Fix.jpeg_ok_64));
 };
@@ -555,9 +596,9 @@ do {
   };
   assert (Media.storageStats(s).blobCount == Media.MAX_PHOTOS_PER_PRINCIPAL);
   // 257th distinct photo → quota error, nothing stored.
-  errContains(
+  errIsQuota(
     upload(s, a, alice, "q256", #photo, "image/jpeg", padded(Fix.jpeg_ok_64, 9999, 34)),
-    "items of this class (cap)",
+    "photos for this principal", Media.MAX_PHOTOS_PER_PRINCIPAL,
   );
   assert (Media.storageStats(s).blobCount == Media.MAX_PHOTOS_PER_PRINCIPAL);
   // Re-uploading an ALREADY-OWNED photo at the cap is idempotent-allowed
@@ -718,6 +759,149 @@ do {
   // Region holds at least the stored bytes (pages × 64 KiB ≥ totalBytes).
   assert (st.regionPages * 65536 >= st.totalBytes);
   Debug.print("  region pages=" # Nat.toText(st.regionPages) # " heap=" # Nat.toText(Prim.rts_heap_size()));
+};
+
+// ═══ v0.4.0 gates — each asserted on the TYPED error, not on prose ═══
+
+// 24. anonymous principal refused at every write arm.
+do {
+  let (s, a) = begin("anonymous principal refused (start / chunk / finish / delete)");
+  let anon = Prim.principalOfBlob(Blob.fromArray([0x04 : Nat8])); // 2vxsx-fae
+  assert (Principal.isAnonymous(anon));
+  switch (Media.startUpload(s, a, anon, "u", #avatar, "image/jpeg", 1)) {
+    case (#err(#Anonymous)) {};
+    case (_) { Debug.print("anonymous start NOT refused"); assert false };
+  };
+  // Nothing staged, nothing stored.
+  assert (Media.chunkProgress(s, "u") == null);
+  assert (Media.storageStats(s).blobCount == 0);
+  // A named principal stages legitimately; the anonymous one still cannot write into it.
+  let alice = p(0x11);
+  assert (Result.isOk(Media.startUpload(s, a, alice, "v", #avatar, "image/jpeg", 1)));
+  switch (Media.storeChunk(s, a, anon, "v", 0, Fix.jpeg_ok_64)) {
+    case (#err(#Anonymous)) {};
+    case (_) { Debug.print("anonymous chunk NOT refused"); assert false };
+  };
+  switch (Media.finishUpload(s, a, anon, "v")) {
+    case (#err(#Anonymous)) {};
+    case (_) { Debug.print("anonymous finish NOT refused"); assert false };
+  };
+  switch (Media.deletePhoto(s, anon, "00" # "00000000000000000000000000000000000000000000000000000000000000")) {
+    case (#err(#Anonymous)) {};
+    case (_) { Debug.print("anonymous delete NOT refused"); assert false };
+  };
+};
+
+// 25. pause blocks the WHOLE upload path — including chunk writes.
+do {
+  let (s, a) = begin("pause blocks start AND chunk AND finish");
+  let alice = p(0x12);
+  // Stage a live upload first, then pause mid-flight.
+  assert (Result.isOk(Media.startUpload(s, a, alice, "u", #photo, "image/jpeg", 2)));
+  assert (Result.isOk(Media.storeChunk(s, a, alice, "u", 0, Fix.jpeg_ok_64)));
+  assert (Admin.setPaused(a, adminP, true));
+  // The arm that matters: staged storage must not keep growing while paused.
+  switch (Media.storeChunk(s, a, alice, "u", 1, Fix.png_ok_64)) {
+    case (#err(#Paused)) {};
+    case (_) { Debug.print("paused chunk NOT refused — storage can still grow"); assert false };
+  };
+  switch (Media.startUpload(s, a, alice, "w", #avatar, "image/jpeg", 1)) {
+    case (#err(#Paused)) {};
+    case (_) { assert false };
+  };
+  switch (Media.finishUpload(s, a, alice, "u")) {
+    case (#err(#Paused)) {};
+    case (_) { assert false };
+  };
+  assert (Media.storageStats(s).blobCount == 0);
+  // Unpause and the same upload completes — pause is a gate, not a corruption.
+  assert (Admin.setPaused(a, adminP, false));
+  assert (Result.isOk(Media.storeChunk(s, a, alice, "u", 1, Fix.png_ok_64)));
+  switch (Media.finishUpload(s, a, alice, "u")) {
+    case (#ok(_)) {};
+    case (#err(e)) { Debug.print("post-unpause finish failed: " # Media.errorText(e)); assert false };
+  };
+};
+
+// 26. quota errors carry limit AND usage (M-1: a panel renders them).
+do {
+  let (s, a) = begin("typed quota error carries scope, limit and usage");
+  let alice = p(0x13);
+  for (i in Nat.range(0, Media.MAX_STAGED_PER_PRINCIPAL)) {
+    assert (Result.isOk(Media.startUpload(s, a, alice, "s" # Nat.toText(i), #avatar, "image/jpeg", 1)));
+  };
+  switch (Media.startUpload(s, a, alice, "over", #avatar, "image/jpeg", 1)) {
+    case (#err(#QuotaExceeded(q))) {
+      assert (q.limit == Media.MAX_STAGED_PER_PRINCIPAL);
+      assert (q.usage == Media.MAX_STAGED_PER_PRINCIPAL);
+      assert (q.scope == "staged uploads for this principal");
+    };
+    case (_) { Debug.print("staging cap did not return a typed quota error"); assert false };
+  };
+  // Storage budget carries its three numbers.
+  let (s2, a2) = begin("typed storage-full error carries cap, used and requested");
+  s2.totalBytes := Media.MAX_MEDIA_BYTES - 10;
+  switch (upload(s2, a2, p(0x14), "u", #avatar, "image/jpeg", Fix.jpeg_ok_64)) {
+    case (#err(#StorageFull(f))) {
+      assert (f.capBytes == 4026531840);
+      assert (f.usedBytes == 4026531840 - 10);
+      assert (f.requestedBytes == Fix.jpeg_ok_64.size());
+    };
+    case (_) { Debug.print("budget did not return a typed StorageFull"); assert false };
+  };
+};
+
+// 27. admin-scoped listing (M-3).
+do {
+  let (s, a) = begin("listPathsFor is admin-scoped; bytes stay public by design");
+  let alice = p(0x15);
+  ignore ok(upload(s, a, alice, "u", #avatar, "image/jpeg", Fix.jpeg_ok_64));
+  switch (Media.listPathsFor(s, a, alice)) {
+    case (#err(#NotAdmin)) {};
+    case (_) { Debug.print("non-admin could enumerate"); assert false };
+  };
+  switch (Media.listPathsFor(s, a, adminP)) {
+    case (#ok(paths)) { assert (paths.size() == 1) };
+    case (#err(_)) { assert false };
+  };
+  // The honest limit of that gate: the path itself still serves to anyone.
+  let path = Media.listPaths(s)[0];
+  assert (Media.httpRequest(s, { method = "GET"; url = path; headers = []; body = "" }).statusCode == 200);
+};
+
+// 28. THE DEFECT FIX: a shared content-addressed path is unlisted only at refcount zero.
+do {
+  let (s, a) = begin("shared photo path survives one owner's delete (fixed)");
+  let alice = p(0x16);
+  let bob = p(0x17);
+  let body = Fix.gif_ok_64;
+  let ra = ok(upload(s, a, alice, "x", #photo, "image/gif", body));
+  ignore ok(upload(s, a, bob, "y", #photo, "image/gif", body));
+  assert (Media.storageStats(s).blobCount == 1);
+  assert (Media.storageStats(s).pathCount == 1);
+  // Alice deletes: bob's media MUST keep serving.
+  switch (Media.deletePhoto(s, alice, ra.sha256Hex)) {
+    case (#ok(d)) { assert d };
+    case (#err(_)) { assert false };
+  };
+  assert (Media.mediaInfo(s, ra.path) != null);
+  assert (Media.httpRequest(s, { method = "GET"; url = ra.path; headers = []; body = "" }).statusCode == 200);
+  assert (Media.storageStats(s).blobCount == 1);
+  assert (Media.storageStats(s).totalBytes == body.size());
+  // Alice really did lose ownership: deleting again is a no-op.
+  switch (Media.deletePhoto(s, alice, ra.sha256Hex)) {
+    case (#ok(d)) { assert (not d) };
+    case (#err(_)) { assert false };
+  };
+  // Bob deletes: last reference drops, path unlisted, bytes reclaimed.
+  switch (Media.deletePhoto(s, bob, ra.sha256Hex)) {
+    case (#ok(d)) { assert d };
+    case (#err(_)) { assert false };
+  };
+  assert (Media.mediaInfo(s, ra.path) == null);
+  assert (Media.httpRequest(s, { method = "GET"; url = ra.path; headers = []; body = "" }).statusCode == 404);
+  assert (Media.storageStats(s).blobCount == 0);
+  assert (Media.storageStats(s).totalBytes == 0);
 };
 
 Debug.print("POLICY SUITE: " # Nat.toText(scenario) # " scenarios PASS");

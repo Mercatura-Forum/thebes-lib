@@ -36,7 +36,7 @@ func upload(
   class_ : Media.Class,
   ct : Text,
   body : Blob,
-) : Result.Result<Media.FinishReply, Text> {
+) : Result.Result<Media.FinishReply, Media.MediaError> {
   // Fixtures are all ≤ 32 KiB → single chunk. Logos are admin-gated, so
   // logo cases upload as the admin.
   let caller = switch (class_) { case (#logo _) adminP; case _ alice };
@@ -45,7 +45,7 @@ func upload(
     case (#err(e)) { return #err(e) };
     case (#ok) {};
   };
-  switch (Media.storeChunk(s, caller, "img", 0, body)) {
+  switch (Media.storeChunk(s, a, caller, "img", 0, body)) {
     case (#err(e)) { return #err(e) };
     case (#ok) {};
   };
@@ -70,7 +70,7 @@ func mustPass(name : Text, class_ : Media.Class, ct : Text, body : Blob) {
       Debug.print("  PASS-accept " # name);
     };
     case (#err(e)) {
-      Debug.print("  FAIL: expected accept for " # name # " got: " # e);
+      Debug.print("  FAIL: expected accept for " # name # " got: " # Media.errorText(e));
       assert false;
     };
   };
@@ -85,9 +85,12 @@ func mustReject(name : Text, class_ : Media.Class, ct : Text, body : Blob, needl
       Debug.print("  FAIL: expected reject for " # name # " but stored " # rep.path);
       assert false;
     };
-    case (#err(e)) {
-      if (not Text.contains(e, #text needle)) {
-        Debug.print("  FAIL: " # name # " error \"" # e # "\" missing \"" # needle # "\"");
+    case (#err(#Validation(v))) {
+      // The VARIANT is asserted, not just the prose: every image refusal is a
+      // #Validation, so a swapped variant fails here even if its rendered
+      // text were preserved.
+      if (not Text.contains(v.reason, #text needle)) {
+        Debug.print("  FAIL: " # name # " reason \"" # v.reason # "\" missing \"" # needle # "\"");
         assert false;
       };
       // Nothing stored, nothing indexed, nothing owned (rollback parity).
@@ -98,6 +101,10 @@ func mustReject(name : Text, class_ : Media.Class, ct : Text, body : Blob, needl
       assert (Media.listPaths(s).size() == 0);
       rejectCount += 1;
       Debug.print("  PASS-reject " # name # " (" # needle # ")");
+    };
+    case (#err(e)) {
+      Debug.print("  FAIL: " # name # " expected #Validation, got " # Media.errorText(e));
+      assert false;
     };
   };
 };
