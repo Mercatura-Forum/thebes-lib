@@ -1,7 +1,7 @@
 /// MemphisAuth.mo — the STANDARD Memphis identity integration for Thebes apps.
 ///
 /// ════════════════════════════════════════════════════════════════════════════
-/// REALITY CHECK — read this before you trust anything below.
+/// THE IDENTITY MODEL
 /// ════════════════════════════════════════════════════════════════════════════
 ///
 /// On Thebes today, for an ingress call, `msg.caller` is the SENDER principal of
@@ -48,16 +48,13 @@
 /// Why an inter-contract call and not a local check? Because only Memphis can
 /// attest that a token is live and maps to an anchor. There is no local secret
 /// your contract could use to verify a Memphis token offline — so verification
-/// MUST be a call to Memphis. This module does that real call; it contains no
-/// stub that "pretends" a token is valid.
+/// MUST be a call to Memphis.
 ///
 /// ════════════════════════════════════════════════════════════════════════════
-/// DEPENDENCY ON THE MEMPHIS CONTRACT UPGRADE — VERIFY POST-UPGRADE.
+/// THE MEMPHIS INTERFACE THIS MODULE BINDS
 /// ════════════════════════════════════════════════════════════════════════════
-/// The deployed cid 921 is currently BEHIND the source IDL this module is typed
-/// against. This module's `Memphis` actor type binds exactly these methods from
-/// memphis.did. After the 921 upgrade, confirm each one EXISTS with this
-/// signature, or the inter-contract calls will trap at runtime:
+/// The `Memphis` actor type below binds exactly these two methods from
+/// memphis.did:
 ///
 ///   • whoami : (blob) -> (variant { Ok : WhoAmIResult; Err : MemphisError }) query
 ///   • derive_principal_for : (blob, text, nat64)
@@ -68,9 +65,9 @@
 /// correct and intended: it is what makes the attestation trustworthy. The
 /// Motoko binding below therefore types them as `shared` (awaitable) methods.
 ///
-/// BINDING POINT: set the Memphis contract id once via `Gate.fromPrincipal` (or
-/// `Gate.fromText`). If 921 is not yet upgraded, calls will return a typed
-/// trap/error you can surface — never a silent success.
+/// BINDING POINT: set the Memphis contract id once via `initFromCid` (or
+/// `initFromText` / `init`), then pass the resulting `State` to `verify`. Every
+/// failure path returns a typed `AuthError` you can surface to the caller.
 
 import Principal "mo:core/Principal";
 import Time "mo:core/Time";
