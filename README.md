@@ -14,7 +14,7 @@ backend toolkit.
 | Module | Responsibility |
 | --- | --- |
 | `Admin` | Controller-gated operations. A pure module the host actor holds one record of; gates privileged entry points behind the canister's controller set. |
-| `MemphisAuth` | Memphis passkey identity. Verifies a passkey session and resolves it to a stable principal the backend can trust. |
+| `MemphisAuth` | Memphis passkey identity. Verifies an **origin-scoped** session token and resolves it to a stable per-app principal the backend can trust. See [Identity, and the two strings you must not confuse](#identity-and-the-two-strings-you-must-not-confuse). |
 | `Users` | User registration, profiles, avatars, and role tiers — built on top of `Admin`. |
 | `Pagination` | Bounded, offset-cursor paging over an ordered array, so every list read stays within a fixed instruction budget. |
 | `Invoices` | Invoicing — line items, on-chain-recomputed totals and tax, a `draft → issued → paid` / `void` lifecycle with per-party guards, and an immutable audit trail. Shared by the commerce and billing examples. |
@@ -29,6 +29,50 @@ state and passes it in. This keeps upgrades simple and the modules trivially tes
 and real header-parsed dimension ceilings (256 px avatar/logo, 1600 px photo) at
 finalize. The app republishes the media tree root via `CertifiedData.set(Media.root(store))`
 after mutations — see the module header for the integration sketch.
+
+
+## Identity, and the two strings you must not confuse
+
+`MemphisAuth.verifyWithAudience(gate, token, audience)` is how a backend
+authenticates a user. Two different strings are in play, and they are frequently
+not equal:
+
+| | What it is | Where it goes | Changing it |
+| --- | --- | --- | --- |
+| `origin` (on `State`) | Your **pseudonym namespace**. Any stable label — `"my-app"` is as valid as a URL. | `derive_principal_for(anchor, origin, version)` | **Rotates every user's principal.** Their data is keyed on it. Never change it on a live app. |
+| `audience` (per call) | The **web origin** your app is served from, e.g. `"https://my-app.com"`. | `whoami_scoped_u(token, audience)` | Harmless — it only says where tokens are accepted from. |
+
+```motoko
+let gate = MemphisAuth.initFromCid(921, "my-app", 1);          // namespace
+let AUDIENCE = "https://my-app.com";                            // web origin
+
+switch (await* MemphisAuth.verifyWithAudience(gate, token, AUDIENCE)) {
+  case (#ok(id)) { /* id.principal — key your state on this */ };
+  case (#err(e)) { /* #Memphis(#Unauthorized) = minted for another origin */ };
+};
+```
+
+`verify(gate, token)` exists and passes `gate.origin` as the audience. That is
+correct **only** when your namespace is literally the URL. If it is a label, it
+fails every time with `#Unauthorized`.
+
+The comparison is **byte-exact**: a trailing slash, a differing port or a case
+difference is a mismatch.
+
+### Why tokens are origin-scoped
+
+A Memphis *master* session token is anchor-scoped — whoever holds it is that
+user everywhere. Handing one to an app lets that app authenticate as its own
+users at every other Thebes app: the confused deputy (Hardy, 1988). So the
+client never receives one. It receives a credential minted for one origin and
+refused at every other — an audience restriction, the same shape as OAuth's
+`aud` (RFC 9068) and Internet Identity's per-frontend delegation.
+
+The scoped token is strictly weaker than the session it came from: it cannot
+outlive it, dies when it is revoked, and dies on sign-out-everywhere.
+
+**Upgrading from 0.x:** a master session token no longer verifies. That is the
+point, not a bug — clients must obtain a scoped token for your origin.
 
 ## Add it
 
