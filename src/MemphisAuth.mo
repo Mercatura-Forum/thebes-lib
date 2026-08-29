@@ -36,10 +36,12 @@
 ///   └────────────────────┴──────────────────────────────────────────────────┘
 ///
 /// TRUST MODEL of the SessionGate pattern below:
-///   1. Client obtains a session token from Memphis (passkey ceremony).
-///   2. Client sends the token to YOUR contract as a normal call argument.
-///   3. YOUR contract calls Memphis `whoami(token)` (inter-contract, replicated)
-///      to verify the token is real and unexpired, learning the `anchor_id`.
+///   1. Client obtains an ORIGIN-SCOPED token from Memphis for YOUR origin
+///      (passkey ceremony, then `issue_scoped_session`).
+///   2. Client sends that token to YOUR contract as a normal call argument.
+///   3. YOUR contract calls `whoami_scoped_u(token, origin)` (inter-contract,
+///      replicated) to verify the token is real, unexpired, AND was minted for
+///      your origin — learning the `anchor_id`.
 ///   4. YOUR contract calls `derive_principal_for(anchor_id, origin, version)`
 ///      to get the user's stable per-app principal, and keys app state on THAT.
 ///   5. Optionally cache (anchor_id, expires_ns) keyed by token to avoid a
@@ -51,19 +53,44 @@
 /// MUST be a call to Memphis.
 ///
 /// ════════════════════════════════════════════════════════════════════════════
+/// BREAKING CHANGE — TOKENS ARE NOW BOUND TO YOUR ORIGIN
+/// ════════════════════════════════════════════════════════════════════════════
+/// Earlier versions of this module called `whoami(token)`, which resolves a
+/// token at ANY origin. That made a token you were handed usable by you at
+/// every other Thebes app, as that user — the confused-deputy problem. This
+/// version calls `whoami_scoped_u(token, s.origin)` instead, and Memphis
+/// refuses a token minted for someone else.
+///
+/// Two consequences when you upgrade:
+///
+///   • A MASTER session token now FAILS verification. That is the point, not a
+///     bug. Clients must obtain a scoped token for your origin.
+///
+///   • `origin` IS NOW SECURITY-CRITICAL. Previously a wrong value only gave
+///     you different pseudonyms — annoying, and recoverable. Now a wrong value
+///     makes `verify` fail outright, because it will not match the origin the
+///     token was minted for. The comparison is BYTE-EXACT: a trailing slash,
+///     a differing port, or different case is a mismatch. Pass exactly the
+///     origin your client mints tokens for, and nothing else.
+///
+/// ════════════════════════════════════════════════════════════════════════════
 /// THE MEMPHIS INTERFACE THIS MODULE BINDS
 /// ════════════════════════════════════════════════════════════════════════════
-/// The `Memphis` actor type below binds exactly these two methods from
-/// memphis.did:
+/// The `Memphis` actor type below mirrors these methods from memphis.did:
 ///
-///   • whoami : (blob) -> (variant { Ok : WhoAmIResult; Err : MemphisError }) query
+///   • whoami_scoped_u : (blob, text)
+///                       -> (variant { Ok : WhoAmIResult; Err : MemphisError })
 ///   • derive_principal_for : (blob, text, nat64)
 ///                            -> (variant { Ok : blob; Err : MemphisError }) query
+///   • whoami : (blob) -> (variant { Ok : WhoAmIResult; Err : MemphisError }) query
+///     (mirrored for completeness; this module no longer calls it)
 ///
-/// `whoami` and `derive_principal_for` are declared `query` in the IDL. When a
-/// CONTRACT calls them, the call runs in a replicated (update) context — that is
-/// correct and intended: it is what makes the attestation trustworthy. The
-/// Motoko binding below therefore types them as `shared` (awaitable) methods.
+/// `derive_principal_for` is declared `query` in the IDL. When a CONTRACT calls
+/// it, the call runs in a replicated (update) context — that is correct and
+/// intended: it is what makes the attestation trustworthy. The Motoko binding
+/// below therefore types it as a `shared` (awaitable) method.
+/// `whoami_scoped_u` is the UPDATE form on purpose — Memphis documents that an
+/// inter-contract await resolves through the update path.
 ///
 /// BINDING POINT: set the Memphis contract id once via `initFromCid` (or
 /// `initFromText` / `init`), then pass the resulting `State` to `verify`. Every
@@ -114,6 +141,12 @@ module {
   public type Memphis = actor {
     whoami : query (Blob) -> async ({ #Ok : WhoAmIResult; #Err : MemphisError });
     derive_principal_for : query (Blob, Text, Nat64) -> async ({ #Ok : Blob; #Err : MemphisError });
+    // The origin-scoped resolution `verify` actually uses. Bound to the UPDATE
+    // form (`_u`), not the query: Memphis documents that an inter-contract
+    // await resolves through the update path, so this is the entry point a
+    // contract is meant to call. `whoami` above is retained for the type to
+    // stay a faithful mirror of the service, and is no longer called here.
+    whoami_scoped_u : (Blob, Text) -> async ({ #Ok : WhoAmIResult; #Err : MemphisError });
   };
 
   // ── The verified identity this module hands back to the app ────────────────
@@ -212,10 +245,11 @@ module {
   ///
   /// Flow (all real work, no shortcuts):
   ///   1. Fast path: return a cached, unexpired identity if present.
-  ///   2. Call Memphis `whoami(token)`. On `Err`, surface `#Memphis(err)`.
-  ///      On `Ok`, check the returned `session_expires_ns` is in the future
-  ///      (defensive: Memphis already enforces this, but we re-check locally so
-  ///      a clock-skew/replay window cannot slip through) — else `#Expired`.
+  ///   2. Call Memphis `whoami_scoped_u(token, s.origin)`. On `Err`, surface
+  ///      `#Memphis(err)`. On `Ok`, check the returned `session_expires_ns` is
+  ///      in the future (defensive: Memphis already enforces this, but we
+  ///      re-check locally so a clock-skew/replay window cannot slip through)
+  ///      — else `#Expired`.
   ///   3. Call Memphis `derive_principal_for(anchor_id, origin, version)` to get
   ///      the stable per-app principal. On `Err`, surface `#Memphis(err)`.
   ///   4. Cache (token -> Identity) keyed by token and return the Identity.
@@ -233,8 +267,11 @@ module {
 
     let m = actorOf(s);
 
-    // Step 2: who does this token belong to, and is it live?
-    let who = switch (await m.whoami(token)) {
+    // Step 2: who does this token belong to, is it live, and was it minted
+    // FOR THIS APP? Passing `s.origin` is what makes the token unusable
+    // anywhere else: Memphis compares it against the origin recorded when the
+    // token was minted and returns #Unauthorized on a mismatch.
+    let who = switch (await m.whoami_scoped_u(token, s.origin)) {
       case (#Err(e)) { return #err(#Memphis(e)) };
       case (#Ok(w)) { w };
     };
