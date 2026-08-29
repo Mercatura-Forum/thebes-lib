@@ -39,9 +39,9 @@
 ///   1. Client obtains an ORIGIN-SCOPED token from Memphis for YOUR origin
 ///      (passkey ceremony, then `issue_scoped_session`).
 ///   2. Client sends that token to YOUR contract as a normal call argument.
-///   3. YOUR contract calls `whoami_scoped_u(token, origin)` (inter-contract,
+///   3. YOUR contract calls `whoami_scoped_u(token, audience)` (inter-contract,
 ///      replicated) to verify the token is real, unexpired, AND was minted for
-///      your origin — learning the `anchor_id`.
+///      your web origin — learning the `anchor_id`.
 ///   4. YOUR contract calls `derive_principal_for(anchor_id, origin, version)`
 ///      to get the user's stable per-app principal, and keys app state on THAT.
 ///   5. Optionally cache (anchor_id, expires_ns) keyed by token to avoid a
@@ -58,7 +58,7 @@
 /// Earlier versions of this module called `whoami(token)`, which resolves a
 /// token at ANY origin. That made a token you were handed usable by you at
 /// every other Thebes app, as that user — the confused-deputy problem. This
-/// version calls `whoami_scoped_u(token, s.origin)` instead, and Memphis
+/// version calls `whoami_scoped_u(token, s.audience)` instead, and Memphis
 /// refuses a token minted for someone else.
 ///
 /// Two consequences when you upgrade:
@@ -66,12 +66,17 @@
 ///   • A MASTER session token now FAILS verification. That is the point, not a
 ///     bug. Clients must obtain a scoped token for your origin.
 ///
-///   • `origin` IS NOW SECURITY-CRITICAL. Previously a wrong value only gave
-///     you different pseudonyms — annoying, and recoverable. Now a wrong value
-///     makes `verify` fail outright, because it will not match the origin the
-///     token was minted for. The comparison is BYTE-EXACT: a trailing slash,
-///     a differing port, or different case is a mismatch. Pass exactly the
-///     origin your client mints tokens for, and nothing else.
+///   • `State` GAINS AN `audience` FIELD, and it is security-critical. It is
+///     the WEB ORIGIN your app is served from — the thing Memphis compares
+///     against, byte-exactly, so a trailing slash, port or case difference is
+///     a mismatch.
+///
+///     It is NOT the same as `origin`. `origin` is your pseudonym namespace and
+///     may be any stable label ("my-app"); changing it rotates every user's
+///     principal, so it must not be touched. `audience` is where your app
+///     lives. Use `initWithAudience` / `initFromCidWithAudience` whenever the
+///     two differ — `init` sets audience = origin, which is right only when
+///     your namespace already IS the URL.
 ///
 /// ════════════════════════════════════════════════════════════════════════════
 /// THE MEMPHIS INTERFACE THIS MODULE BINDS
@@ -176,14 +181,22 @@ module {
   /// public URL/origin and a version integer you bump on identity-scheme breaks).
   public type State = {
     memphis : Principal; // cid 921 (or test id) — the Memphis contract
-    origin : Text; // your app origin, e.g. "https://<cid>.icp0.io"
+    // PSEUDONYM NAMESPACE. Feeds derive_principal_for, so it decides your
+    // users' principals. It is an arbitrary stable label — often a URL, but
+    // "my-app" is equally valid. NEVER change it on a live app: every user's
+    // principal would change with it and their data would be orphaned.
+    origin : Text;
     version : Nat64; // pseudonym scheme version (start at 0/1)
     // token -> (anchorId, principal, expiresNs). Avoids a round-trip per call
     // until the cached expiry passes. Keyed by the opaque session token bytes.
     var cache : Map.Map<Blob, Identity>;
   };
 
-  /// Build a gate. Call once at actor init and store in a stable var.
+  /// Build a gate whose pseudonym namespace and audience are the SAME string.
+  /// Correct only when your namespace already IS the web origin your app is
+  /// served from (e.g. both "https://my-app.com"). If they differ — and they do
+  /// whenever the namespace is a label like "my-app" — use `initWithAudience`,
+  /// or every verification will fail with #Unauthorized.
   public func init(memphis : Principal, origin : Text, version : Nat64) : State {
     {
       memphis;
@@ -192,6 +205,15 @@ module {
       var cache = Map.empty<Blob, Identity>();
     };
   };
+
+  /// Build a gate with an explicit audience. Use this whenever the pseudonym
+  /// namespace is not literally the web origin tokens are minted against.
+  ///
+  ///   initWithAudience(memphis, "thebes-hosting", "https://thebesprotocol.com", 1)
+  ///                              ^ namespace        ^ audience
+  ///
+  /// Changing `origin` rotates every user's principal; changing `audience` does
+  /// not touch identity at all — it only says where tokens are accepted from.
 
   /// Convenience: build a gate from a textual contract id (e.g. "aaaaa-aa").
   public func initFromText(memphisText : Text, origin : Text, version : Nat64) : State {
@@ -218,6 +240,12 @@ module {
     init(principalOfCid(cid), origin, version);
   };
 
+  /// `initFromCid` with an explicit audience — the usual constructor for an app
+  /// whose pseudonym namespace is a label rather than its URL.
+  ///
+  ///   var gate = MemphisAuth.initFromCidWithAudience(
+  ///     921, "my-app", "https://my-app.com", 1);
+
   /// The live Memphis actor reference for this gate's configured contract id.
   public func actorOf(s : State) : Memphis {
     actor (Principal.toText(s.memphis)) : Memphis;
@@ -240,12 +268,22 @@ module {
 
   // ── The two real operations ────────────────────────────────────────────────
 
-  /// VERIFY a session token against Memphis and return the user's stable per-app
+
+  /// Verify a token, presenting `s.origin` as the audience.
+  ///
+  /// Correct ONLY when your pseudonym namespace is literally the web origin
+  /// your app is served from. If it is a label like "my-app", this always
+  /// fails with #Unauthorized — use `verifyWithAudience` and pass the URL.
+  public func verify(s : State, token : Blob) : async Result.Result<Identity, AuthError> {
+    await verifyWithAudience(s, token, s.origin);
+  };
+
+  /// VERIFY a token that was minted for `audience`, and return the user's stable per-app
   /// Identity. This is the function every authenticated method calls.
   ///
   /// Flow (all real work, no shortcuts):
   ///   1. Fast path: return a cached, unexpired identity if present.
-  ///   2. Call Memphis `whoami_scoped_u(token, s.origin)`. On `Err`, surface
+  ///   2. Call Memphis `whoami_scoped_u(token, s.audience)`. On `Err`, surface
   ///      `#Memphis(err)`. On `Ok`, check the returned `session_expires_ns` is
   ///      in the future (defensive: Memphis already enforces this, but we
   ///      re-check locally so a clock-skew/replay window cannot slip through)
@@ -255,7 +293,7 @@ module {
   ///   4. Cache (token -> Identity) keyed by token and return the Identity.
   ///
   /// Cost: two inter-contract calls on a cache miss, zero on a cache hit.
-  public func verify(s : State, token : Blob) : async Result.Result<Identity, AuthError> {
+  public func verifyWithAudience(s : State, token : Blob, audience : Text) : async Result.Result<Identity, AuthError> {
     // Time.now() is nanoseconds-since-epoch as an Int (always positive on IC);
     // Memphis expiries are Nat64, so we compare in the Nat64 domain.
     let nowNs : Nat64 = Nat64.fromNat(Int.toNat(Time.now()));
@@ -271,7 +309,7 @@ module {
     // FOR THIS APP? Passing `s.origin` is what makes the token unusable
     // anywhere else: Memphis compares it against the origin recorded when the
     // token was minted and returns #Unauthorized on a mismatch.
-    let who = switch (await m.whoami_scoped_u(token, s.origin)) {
+    let who = switch (await m.whoami_scoped_u(token, audience)) {
       case (#Err(e)) { return #err(#Memphis(e)) };
       case (#Ok(w)) { w };
     };
