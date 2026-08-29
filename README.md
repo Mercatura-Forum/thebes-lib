@@ -1,6 +1,6 @@
 # thebes-lib
 
-The Motoko backend library for [Thebes Protocol](https://github.com/Mercatura-Forum/Thebes-Protocol-)
+The Motoko backend library for [Thebes Protocol](https://thebesprotocol.com)
 applications. It provides the six building blocks a production dapp backend needs —
 controller-gated administration, passkey identity, user management, bounded
 pagination, invoicing, and on-chain certified media — as pure, composable modules
