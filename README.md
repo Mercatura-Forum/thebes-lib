@@ -39,7 +39,7 @@ not equal:
 
 | | What it is | Where it goes | Changing it |
 | --- | --- | --- | --- |
-| `origin` (on `State`) | Your **pseudonym namespace**. Any stable label — `"my-app"` is as valid as a URL. | `derive_principal_for(anchor, origin, version)` | **Rotates every user's principal.** Their data is keyed on it. Never change it on a live app. |
+| `origin` (on `State`) | Your **pseudonym namespace**. Any stable label — `"my-app"` is as valid as a URL. | `derive_principal_for_u(anchor, origin, version)` | **Rotates every user's principal.** Their data is keyed on it. Never change it on a live app. |
 | `audience` (per call) | The **web origin** your app is served from, e.g. `"https://my-app.com"`. | `whoami_scoped_u(token, audience)` | Harmless — it only says where tokens are accepted from. |
 
 ```motoko
@@ -58,6 +58,34 @@ fails every time with `#Unauthorized`.
 
 The comparison is **byte-exact**: a trailing slash, a differing port or a case
 difference is a mismatch.
+
+### Two rules that are not style preferences
+
+**1. `await*`, never `await`.** `verify` and `verifyWithAudience` are `async*`.
+A module-level `async` helper that awaits another contract loses the caller's
+continuation: the engine replies with the *inner* awaited value instead of your
+handler's own return, and state mutations after the await are dropped. The
+symptom is a client-side Candid decode error naming a field your method never
+declared — the client is decoding `Result<Identity, AuthError>`, not your type.
+
+> Diagnostic that isolates it in one step: call an update that makes **no**
+> inter-contract call, and one that does. If the first returns its declared type
+> and the second returns the callee's, this is your bug. Anything else is a red
+> herring.
+
+**2. Bind the `_u` methods, never the `query` ones.** Memphis exports
+`whoami` / `derive_principal_for` as queries for the browser, and
+`whoami_scoped_u` / `derive_principal_for_u` as updates with identical bodies
+for contracts. A contract-to-contract `await` on a query export gets no reply on
+this substrate — the call fails as `method 'canister_update <name>' not found`.
+Probing the query form over the boundary's `POST /api/query` **succeeds**, which
+is what makes a wrong binding look correct; that path exercises the callee's
+query entry point, not the path a contract takes.
+
+The full integration guide — including the browser half (passkey ceremony,
+discoverable credentials, confirm-before-mint) — is
+[`docs/memphis.md`](https://github.com/Mercatura-Forum/thebes-sdk/blob/main/docs/memphis.md)
+in the SDK.
 
 ### Why tokens are origin-scoped
 
@@ -83,8 +111,14 @@ account required. Pin a tag for reproducible builds:
 # mops.toml
 [dependencies]
 core = "2.5.0"
-thebes-lib = "https://github.com/Mercatura-Forum/thebes-lib#v0.4.0"
+thebes-lib = "https://github.com/Mercatura-Forum/thebes-lib#v1.0.0"
 ```
+
+> **Do not pin `v0.4.0` or earlier.** Those tags predate origin-scoped sessions:
+> `MemphisAuth.verify` calls `whoami`, which resolves a token at *any* origin, so
+> a token your app is handed authenticates as that user at every other Thebes
+> app. `v1.0.0` is the first tag with the scoped call, the `_u` bindings and the
+> `async*` signatures.
 
 ```sh
 mops install
