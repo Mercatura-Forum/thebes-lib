@@ -372,4 +372,46 @@ module {
     };
   };
 
+  // ── Binding a session to the caller that opened it ────────────────────────
+  //
+  // A query that reads a session from the cache must also check WHO asks. The token reaches the app as an update
+  // argument, and update arguments are part of the chain's blocks: a check on the token alone is a check anyone who
+  // reads the chain can pass, for as long as the session lives. Bind each verified token to the caller of the update
+  // that verified it, and have a query answer only that caller. A query's caller is proven once the node checks query
+  // signatures (`EGYPT_QUERY_SIGNATURES=enforce`, INV-QUERY-SENDER); the SDK signs every query with the browser's key.
+  //
+  // `Holders` is its own type, held in its own stable var beside the gate: `State` is unchanged, so an app already
+  // holding a gate upgrades without a migration.
+
+  /// Who opened each session: token -> the caller of the update that verified it.
+  public type Holders = { var byToken : Map.Map<Blob, Principal> };
+
+  public func initHolders() : Holders { { var byToken = Map.empty<Blob, Principal>() } };
+
+  /// Record that `caller` opened the session `token`. Call it in the update that verified the token (after `verify` or
+  /// `verifyWithAudience` returned #ok), with that update's own caller. An anonymous caller is never bound.
+  public func bindHolder(h : Holders, token : Blob, caller : Principal) {
+    if (not Principal.isAnonymous(caller)) { Map.add(h.byToken, Blob.compare, token, caller) };
+  };
+
+  /// The cached identity for `token`, unexpired at `nowNs`, and only when `caller` is the caller that opened it. Null
+  /// otherwise: an unknown or unbound token, another caller, the anonymous caller, an expired session. For queries,
+  /// which cannot await: it changes nothing.
+  public func cachedFor(s : State, h : Holders, token : Blob, caller : Principal, nowNs : Nat64) : ?Identity {
+    if (Principal.isAnonymous(caller)) { return null };
+    switch (Map.get(h.byToken, Blob.compare, token)) {
+      case (?holder) { if (not Principal.equal(holder, caller)) { return null } };
+      case null { return null };
+    };
+    switch (Map.get(s.cache, Blob.compare, token)) {
+      case (?id) { if (id.expiresNs > nowNs) { ?id } else { null } };
+      case null { null };
+    };
+  };
+
+  /// Drop a token's binding (with `forget`, when the user signs out). Idempotent.
+  public func forgetHolder(h : Holders, token : Blob) {
+    ignore Map.delete(h.byToken, Blob.compare, token);
+  };
+
 };
