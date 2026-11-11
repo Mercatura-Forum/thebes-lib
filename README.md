@@ -102,6 +102,36 @@ outlive it, dies when it is revoked, and dies on sign-out-everywhere.
 **Upgrading from 0.x:** a master session token no longer verifies. That is the
 point, not a bug — clients must obtain a scoped token for your origin.
 
+### Bind a session to the caller that opened it
+
+A session token reaches your contract as an update argument, and update
+arguments are part of the chain's blocks. A query that checks the token alone
+is a check anyone who reads the chain can pass while the session lives. So
+bind each verified token to the caller of the update that verified it, and have
+your queries answer only that caller:
+
+```motoko
+stable var holders = MemphisAuth.initHolders();
+
+public shared ({ caller }) func openSession(token : Blob) : async Bool {
+  switch (await* MemphisAuth.verify(gate, token)) {
+    case (#ok _) { MemphisAuth.bindHolder(holders, token, caller); true };
+    case (#err _) false;
+  }
+};
+
+public shared query ({ caller }) func mine(token : Blob) : async ?Text {
+  let ?id = MemphisAuth.cachedFor(gate, holders, token, caller, Nat64.fromIntWrap(Time.now())) else return null;
+  ?Principal.toText(id.principal)
+};
+```
+
+A query's caller is proven when the node checks query signatures: the SDK
+(`@thebes/sdk` 0.7.0) signs every query with the browser's key, and a node that
+enforces them answers an unsigned query naming someone else as anonymous.
+`Holders` is a separate type, so a contract already holding a gate upgrades
+without a migration.
+
 ## Add it
 
 `thebes-lib` is consumed as a [mops](https://mops.one) GitHub dependency — no registry
